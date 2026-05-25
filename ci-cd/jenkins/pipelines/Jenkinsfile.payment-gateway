@@ -3,7 +3,7 @@
 // Domain: Banking & Payments | Cloud: GCP | Cluster: GKE
 // ============================================================
 pipeline {
-    agent { label 'agent any' }
+    agent any
 
     environment {
         SERVICE_NAME    = 'payment-gateway'
