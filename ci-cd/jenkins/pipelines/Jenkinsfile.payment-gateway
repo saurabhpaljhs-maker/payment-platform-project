@@ -3,7 +3,7 @@
 // Domain: Banking & Payments | Cloud: GCP | Cluster: GKE
 // ============================================================
 pipeline {
-    agent any
+    agent { label 'payment' }
 
     environment {
         SERVICE_NAME    = 'payment-gateway'
@@ -150,36 +150,69 @@ Deploy payment-gateway:${IMAGE_TAG} to PRODUCTION?
         }
     }
 
-    post {
-        success {
-            slackSend channel: env.SLACK_CHANNEL, color: 'good',
-                message: """✅ *DEPLOYED TO PROD* — `${SERVICE_NAME}`
+post {
+
+    success {
+
+        echo "✅ DEPLOYED SUCCESSFULLY"
+
+        slackSend(
+            channel: env.SLACK_CHANNEL,
+            color: 'good',
+            message: """✅ *DEPLOYED TO PROD* — `${SERVICE_NAME}`
 Build: `#${BUILD_NUMBER}` | Image: `${IMAGE_TAG}`
-Branch: `${BRANCH_NAME}` | Author: `${GIT_AUTHOR}`
-_${GIT_MESSAGE}_
+Branch: `${env.BRANCH_NAME}`
+Author: `${env.GIT_AUTHOR}`
+
+_${env.GIT_MESSAGE}_
+
 <${BUILD_URL}|View Build>"""
-        }
-        failure {
-            script {
-                if (env.BRANCH_NAME == 'main') {
-                    echo "Triggering automatic rollback..."
-                    sh """
-                        gcloud container clusters get-credentials ${GKE_CLUSTER}                             --region ${GCP_REGION} --project ${GCP_PROJECT}
-                        kubectl rollout undo deployment/${SERVICE_NAME} -n ${K8S_NAMESPACE}
-                        kubectl rollout status deployment/${SERVICE_NAME} -n ${K8S_NAMESPACE} --timeout=120s
-                    """
-                }
+        )
+    }
+
+    failure {
+
+        script {
+
+            if (env.BRANCH_NAME == 'main') {
+
+                echo "Triggering automatic rollback..."
+
+                sh """
+                    gcloud container clusters get-credentials ${GKE_CLUSTER} \
+                    --region ${GCP_REGION} \
+                    --project ${GCP_PROJECT}
+
+                    kubectl rollout undo deployment/${SERVICE_NAME} \
+                    -n ${K8S_NAMESPACE}
+
+                    kubectl rollout status deployment/${SERVICE_NAME} \
+                    -n ${K8S_NAMESPACE} \
+                    --timeout=120s
+                """
             }
-            slackSend channel: env.SLACK_CHANNEL, color: 'danger',
-                message: """❌ *DEPLOY FAILED* — `${SERVICE_NAME}` #${BUILD_NUMBER}
-Stage: `${STAGE_NAME}` | Branch: `${BRANCH_NAME}`
+        }
+
+        slackSend(
+            channel: env.SLACK_CHANNEL,
+            color: 'danger',
+            message: """❌ *DEPLOY FAILED* — `${SERVICE_NAME}`
+
+Build: `#${BUILD_NUMBER}`
+Stage: `${env.STAGE_NAME}`
+Branch: `${env.BRANCH_NAME}`
+
 Rollback: triggered automatically
-<${BUILD_URL}/console|View Logs> | <!here>"""
-        }
-        always {
-            sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG} || true"
-            cleanWs()
-        }
+
+<${BUILD_URL}/console|View Logs>"""
+        )
+    }
+
+    always {
+
+        sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG} || true"
+
+        cleanWs()
     }
 }
 
