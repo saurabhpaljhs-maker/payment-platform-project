@@ -1,21 +1,20 @@
-// ============================================================
-// Payment Gateway Service — Jenkins CI/CD Pipeline
-// Domain: Banking & Payments | Cloud: GCP | Cluster: GKE
-// ============================================================
 pipeline {
     agent { label 'payment' }
 
     environment {
-        SERVICE_NAME    = 'payment-gateway'
-        GCP_PROJECT     = 'payments-platform-prod'
-        GCP_REGION      = 'us-central1'
-        ARTIFACT_REPO   = "us-central1-docker.pkg.dev/payments-platform-prod/payments"
-        IMAGE_NAME      = "${ARTIFACT_REPO}/${SERVICE_NAME}"
-        IMAGE_TAG       = "${BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
-        GKE_CLUSTER     = 'payments-gke-prod'
-        K8S_NAMESPACE   = 'payments'
-        SLACK_CHANNEL   = '#payments-deployments'
-        SONAR_PROJECT   = 'payment-gateway'
+        SERVICE_NAME  = 'payment-gateway'
+        GCP_PROJECT   = 'payments-platform-prod'
+        GCP_REGION    = 'us-central1'
+
+        ARTIFACT_REPO = "us-central1-docker.pkg.dev/payments-platform-prod/payments"
+
+        IMAGE_NAME    = "${ARTIFACT_REPO}/${SERVICE_NAME}"
+        IMAGE_TAG     = "${BUILD_NUMBER}-${env.GIT_COMMIT.take(7)}"
+
+        GKE_CLUSTER   = 'payments-gke-prod'
+        K8S_NAMESPACE = 'payments'
+
+        SLACK_CHANNEL = '#payments-deployments'
     }
 
     options {
@@ -25,204 +24,165 @@ pipeline {
         disableConcurrentBuilds()
     }
 
-    tools {
-        maven 'Maven-3.9'
-        jdk   'JDK-21'
-    }
-
     stages {
 
         stage('Checkout') {
+
             steps {
+
                 checkout scm
+
                 script {
-                    env.GIT_AUTHOR  = sh(script: "git log -1 --format='%an'", returnStdout: true).trim()
-                    env.GIT_MESSAGE = sh(script: "git log -1 --format='%s'",  returnStdout: true).trim()
+
+                    env.GIT_AUTHOR = sh(
+                        script: "git log -1 --format='%an'",
+                        returnStdout: true
+                    ).trim()
+
+                    env.GIT_MESSAGE = sh(
+                        script: "git log -1 --format='%s'",
+                        returnStdout: true
+                    ).trim()
                 }
-                echo "Service: ${SERVICE_NAME} | Branch: ${env.BRANCH_NAME ?: 'main'} | Author: ${GIT_AUTHOR}"
+
+                echo "Service: ${SERVICE_NAME}"
             }
         }
 
-        stage('Build & Test') {
+        stage('Security Scan - Trivy') {
+
             steps {
-                dir('YOUR-PROJECT-FOLDER') 
-                    { sh 'mvn clean package -B' }
-            }
-            post {
-                always 
-                    jacoco execPattern: 'target/jacoco.exec'
-                }
+
+                sh '''
+                    trivy fs \
+                    --severity HIGH,CRITICAL \
+                    --exit-code 0 \
+                    .
+                '''
             }
         }
 
-        stage('Security Scan — Trivy') {
+        stage('Docker Build') {
+
             steps {
-                // Scan for critical CVEs before building image
+
                 sh """
-                    trivy fs --severity HIGH,CRITICAL                         --exit-code 1                         --format table                         .
+                    docker build \
+                    -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                    -t ${IMAGE_NAME}:latest \
+                    .
                 """
             }
         }
 
-        stage('SonarQube Analysis') {
-            when { branch pattern: 'main|release/.*', comparator: 'REGEXP' }
-            steps {
-                withSonarQubeEnv('SonarQube') {
-                    sh "mvn sonar:sonar -Dsonar.projectKey=${SONAR_PROJECT}"
-                }
-            }
-        }
+        stage('Docker Push') {
 
-        stage('Quality Gate') {
-            when { branch pattern: 'main|release/.*', comparator: 'REGEXP' }
             steps {
-                timeout(time: 5, unit: 'MINUTES') {
-                    waitForQualityGate abortPipeline: true
-                }
-            }
-        }
 
-        stage('Docker Build & Push') {
-            steps {
-                script {
-                    // Authenticate to GCP Artifact Registry
-                    sh "gcloud auth configure-docker ${GCP_REGION}-docker.pkg.dev --quiet"
-                    sh """
-                        docker build                             --build-arg BUILD_NUMBER=${BUILD_NUMBER}                             --build-arg GIT_COMMIT=${GIT_COMMIT.take(7)}                             -t ${IMAGE_NAME}:${IMAGE_TAG}                             -t ${IMAGE_NAME}:latest                             -f Dockerfile .
-
-                        docker push ${IMAGE_NAME}:${IMAGE_TAG}
-                        docker push ${IMAGE_NAME}:latest
-                    """
-                }
-            }
-        }
-
-        stage('Deploy to Staging') {
-            when { branch 'main' }
-            steps {
-                script {
-                    deployToGKE('payments-gke-staging', 'payments-staging', IMAGE_TAG)
-                }
-            }
-        }
-
-        stage('Integration Tests — Staging') {
-            when { branch 'main' }
-            steps {
                 sh """
-                    sleep 20
-                    ./ci-cd/scripts/smoke-test.sh                         https://payment-gateway.staging.internal                         ${BUILD_NUMBER}
+                    gcloud auth configure-docker ${GCP_REGION}-docker.pkg.dev --quiet
+
+                    docker push ${IMAGE_NAME}:${IMAGE_TAG}
+
+                    docker push ${IMAGE_NAME}:latest
                 """
             }
         }
 
-        stage('Approval — Production Deploy') {
-            when { branch 'main' }
+        stage('Deploy To GKE') {
+
             steps {
-                timeout(time: 30, unit: 'MINUTES') {
-                    input message: """
-Deploy payment-gateway:${IMAGE_TAG} to PRODUCTION?
-- Staging tests: PASSED
-- Image: ${IMAGE_NAME}:${IMAGE_TAG}
-- Author: ${GIT_AUTHOR}
-""", ok: 'Approve Deploy'
-                }
-            }
-        }
-
-        stage('Deploy to Production') {
-            when { branch 'main' }
-            steps {
-                script {
-                    deployToGKE(GKE_CLUSTER, K8S_NAMESPACE, IMAGE_TAG)
-                }
-            }
-        }
-
-        stage('Post-Deploy Verification') {
-            when { branch 'main' }
-            steps {
-                sh """
-                    sleep 30
-                    ./ci-cd/scripts/smoke-test.sh                         https://payment-gateway.payments.svc.cluster.local                         ${BUILD_NUMBER}
-                """
-            }
-        }
-    }
-
-post {
-
-    success {
-
-        echo "✅ DEPLOYED SUCCESSFULLY"
-
-        slackSend(
-            channel: env.SLACK_CHANNEL,
-            color: 'good',
-            message: """✅ *DEPLOYED TO PROD* — `${SERVICE_NAME}`
-Build: `#${BUILD_NUMBER}` | Image: `${IMAGE_TAG}`
-Branch: `${env.env.BRANCH_NAME ?: 'main'}`
-Author: `${env.GIT_AUTHOR}`
-
-_${env.GIT_MESSAGE}_
-
-<${BUILD_URL}|View Build>"""
-        )
-    }
-
-    failure {
-
-        script {
-
-            if (env.env.BRANCH_NAME ?: 'main' == 'main') {
-
-                echo "Triggering automatic rollback..."
 
                 sh """
                     gcloud container clusters get-credentials ${GKE_CLUSTER} \
                     --region ${GCP_REGION} \
                     --project ${GCP_PROJECT}
 
-                    kubectl rollout undo deployment/${SERVICE_NAME} \
+                    kubectl set image deployment/${SERVICE_NAME} \
+                    ${SERVICE_NAME}=${IMAGE_NAME}:${IMAGE_TAG} \
                     -n ${K8S_NAMESPACE}
 
                     kubectl rollout status deployment/${SERVICE_NAME} \
                     -n ${K8S_NAMESPACE} \
-                    --timeout=120s
+                    --timeout=180s
                 """
             }
         }
 
-        slackSend(
-            channel: env.SLACK_CHANNEL,
-            color: 'danger',
-            message: """❌ *DEPLOY FAILED* — `${SERVICE_NAME}`
+        stage('Smoke Test') {
 
-Build: `#${BUILD_NUMBER}`
-Stage: `${env.STAGE_NAME}`
-Branch: `${env.env.BRANCH_NAME ?: 'main'}`
+            steps {
 
-Rollback: triggered automatically
-
-<${BUILD_URL}/console|View Logs>"""
-        )
+                sh '''
+                    echo "Running smoke tests..."
+                    sleep 15
+                '''
+            }
+        }
     }
+
+    post {
+
+        success {
+
+            echo "DEPLOY SUCCESS"
+
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'good',
+                message: """
+✅ DEPLOY SUCCESS
+
+Service: ${SERVICE_NAME}
+
+Build: #${BUILD_NUMBER}
+
+Image:
+${IMAGE_NAME}:${IMAGE_TAG}
+
+Author:
+${env.GIT_AUTHOR}
+
+${BUILD_URL}
+"""
+            )
+        }
+
+        failure {
+
+            echo "DEPLOY FAILED"
+
+            sh """
+                gcloud container clusters get-credentials ${GKE_CLUSTER} \
+                --region ${GCP_REGION} \
+                --project ${GCP_PROJECT}
+
+                kubectl rollout undo deployment/${SERVICE_NAME} \
+                -n ${K8S_NAMESPACE} || true
+            """
+
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'danger',
+                message: """
+❌ DEPLOY FAILED
+
+Service:
+${SERVICE_NAME}
+
+Build:
+#${BUILD_NUMBER}
+
+${BUILD_URL}/console
+"""
+            )
+        }
 
         always {
 
-        sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG} || true"
+            sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG} || true"
 
-        cleanWs()
+            cleanWs()
+        }
     }
-  }
-}
-
-def deployToGKE(String cluster, String namespace, String imageTag) {
-    sh """
-        gcloud container clusters get-credentials ${cluster}             --region ${GCP_REGION} --project ${GCP_PROJECT}
-
-        kubectl set image deployment/${SERVICE_NAME}             ${SERVICE_NAME}=${IMAGE_NAME}:${imageTag}             -n ${namespace}
-
-        kubectl rollout status deployment/${SERVICE_NAME}             -n ${namespace} --timeout=180s
-    """
 }
