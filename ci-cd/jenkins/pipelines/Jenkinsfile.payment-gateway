@@ -45,7 +45,8 @@ pipeline {
 
         stage('Build & Test') {
             steps {
-                sh 'mvn clean package -B'
+                dir('YOUR-PROJECT-FOLDER') 
+                    { sh 'mvn clean package -B' }
             }
             post {
                 always {
