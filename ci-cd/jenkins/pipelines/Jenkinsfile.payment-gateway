@@ -39,7 +39,7 @@ pipeline {
                     env.GIT_AUTHOR  = sh(script: "git log -1 --format='%an'", returnStdout: true).trim()
                     env.GIT_MESSAGE = sh(script: "git log -1 --format='%s'",  returnStdout: true).trim()
                 }
-                echo "Service: ${SERVICE_NAME} | Branch: ${BRANCH_NAME} | Author: ${GIT_AUTHOR}"
+                echo "Service: ${SERVICE_NAME} | Branch: ${env.BRANCH_NAME} | Author: ${GIT_AUTHOR}"
             }
         }
 
@@ -161,7 +161,7 @@ post {
             color: 'good',
             message: """✅ *DEPLOYED TO PROD* — `${SERVICE_NAME}`
 Build: `#${BUILD_NUMBER}` | Image: `${IMAGE_TAG}`
-Branch: `${env.BRANCH_NAME}`
+Branch: `${env.env.BRANCH_NAME}`
 Author: `${env.GIT_AUTHOR}`
 
 _${env.GIT_MESSAGE}_
@@ -174,7 +174,7 @@ _${env.GIT_MESSAGE}_
 
         script {
 
-            if (env.BRANCH_NAME == 'main') {
+            if (env.env.BRANCH_NAME == 'main') {
 
                 echo "Triggering automatic rollback..."
 
@@ -200,7 +200,7 @@ _${env.GIT_MESSAGE}_
 
 Build: `#${BUILD_NUMBER}`
 Stage: `${env.STAGE_NAME}`
-Branch: `${env.BRANCH_NAME}`
+Branch: `${env.env.BRANCH_NAME}`
 
 Rollback: triggered automatically
 
