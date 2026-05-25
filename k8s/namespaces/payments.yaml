@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments
+  labels:
+    name: payments
+    env: production
+    team: platform-devops
+  annotations:
+    contact: "devops-team@company.com"

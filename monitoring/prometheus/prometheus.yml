@@ -1,0 +1,73 @@
+# Prometheus Configuration — Payment Platform
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster:     'payments-gke-prod'
+    environment: 'production'
+    team:        'platform-devops'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+rule_files:
+  - "rules/payment-alerts.yml"
+  - "rules/infra-alerts.yml"
+
+scrape_configs:
+
+  # Payment Gateway — transaction metrics
+  - job_name: 'payment-gateway'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: ['payments']
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        target_label: __address__
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+
+  # Transaction Service
+  - job_name: 'transaction-service'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: ['payments']
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: transaction-service
+
+  # GKE Node metrics via node-exporter
+  - job_name: 'node-exporter'
+    kubernetes_sd_configs:
+      - role: node
+    relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/$1/proxy/metrics
+
+  # kube-state-metrics — K8s object state
+  - job_name: 'kube-state-metrics'
+    static_configs:
+      - targets: ['kube-state-metrics.monitoring.svc.cluster.local:8080']

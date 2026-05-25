@@ -1,0 +1,104 @@
+# Payment-specific Alert Rules — NCR Voyix / Banking Domain
+groups:
+  - name: payment-gateway-alerts
+    interval: 30s
+    rules:
+
+      # Critical: Transaction success rate drops below 98%
+      - alert: PaymentGatewayHighFailureRate
+        expr: |
+          (
+            sum(rate(payment_transactions_total{status="failed"}[5m]))
+            /
+            sum(rate(payment_transactions_total[5m]))
+          ) * 100 > 2
+        for: 2m
+        labels:
+          severity: critical
+          team:     payments
+          service:  payment-gateway
+        annotations:
+          summary:     "High payment failure rate on {{ $labels.instance }}"
+          description: "Payment failure rate is {{ $value | printf "%.2f" }}% — threshold is 2%. Immediate investigation required."
+          runbook:     "https://wiki.internal/runbooks/payment-gateway-failures"
+          dashboard:   "https://grafana.internal/d/payment-gateway"
+
+      # Warning: p99 latency exceeds 500ms
+      - alert: PaymentGatewayHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_server_requests_seconds_bucket{
+              app="payment-gateway",
+              uri="/api/v1/payment"
+            }[5m])) by (le)
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          team:     payments
+        annotations:
+          summary:     "Payment gateway p99 latency above 500ms"
+          description: "p99 latency is {{ $value | humanizeDuration }}. SLA threshold: 500ms."
+
+      # Critical: No transactions processed in 5 minutes (dead service)
+      - alert: PaymentGatewayNoTransactions
+        expr: |
+          sum(rate(payment_transactions_total[5m])) == 0
+        for: 5m
+        labels:
+          severity: critical
+          team:     payments
+        annotations:
+          summary:     "Payment gateway processing ZERO transactions"
+          description: "No transactions processed in last 5 minutes. Service may be down or network issue."
+          runbook:     "https://wiki.internal/runbooks/payment-gateway-down"
+
+      # Warning: Transaction volume spike — possible fraud or load issue
+      - alert: PaymentTransactionSpike
+        expr: |
+          sum(rate(payment_transactions_total[5m]))
+          > 2 * sum(rate(payment_transactions_total[1h] offset 1d))
+        for: 3m
+        labels:
+          severity: warning
+          team:     payments
+        annotations:
+          summary:     "Unusual transaction volume spike detected"
+          description: "Current TPS is 2x the normal rate from same time yesterday. Possible fraud or load event."
+
+  - name: infra-alerts
+    rules:
+
+      # GKE pod crash loop
+      - alert: PodCrashLooping
+        expr: rate(kube_pod_container_status_restarts_total{namespace="payments"}[15m]) * 60 * 15 > 3
+        for: 5m
+        labels:
+          severity: warning
+          team:     platform-devops
+        annotations:
+          summary:     "Pod {{ $labels.pod }} is crash looping"
+          description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} restarted {{ $value | printf "%.0f" }} times in 15 minutes."
+
+      # Node memory pressure
+      - alert: NodeMemoryPressure
+        expr: (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 < 15
+        for: 5m
+        labels:
+          severity: warning
+          team:     platform-devops
+        annotations:
+          summary:     "Node {{ $labels.instance }} low memory"
+          description: "Available memory is {{ $value | printf "%.1f" }}% — below 15% threshold."
+
+      # Cloud SQL connection pool near limit
+      - alert: CloudSQLConnectionsHigh
+        expr: cloudsql_database_postgresql_num_backends > 180
+        for: 5m
+        labels:
+          severity: critical
+          team:     platform-devops
+        annotations:
+          summary:     "Cloud SQL connection pool near exhaustion"
+          description: "{{ $value }} active connections — limit is 200. Connection pool exhaustion will cause transaction failures."
+          runbook:     "https://wiki.internal/runbooks/db-connection-pool"

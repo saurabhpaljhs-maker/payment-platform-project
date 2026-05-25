@@ -1,0 +1,55 @@
+# Production Environment — Payment Platform GCP
+# DO NOT APPLY without team lead approval + change ticket
+
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+  # Remote state stored in GCS — prevents state conflicts across team
+  backend "gcs" {
+    bucket = "payments-tfstate-prod"
+    prefix = "terraform/state/prod"
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+module "vpc" {
+  source       = "../../modules/vpc"
+  project_id   = var.project_id
+  project_name = var.project_name
+  environment  = "prod"
+  region       = var.region
+}
+
+module "gke" {
+  source           = "../../modules/gke"
+  project_id       = var.project_id
+  project_name     = var.project_name
+  environment      = "prod"
+  region           = var.region
+  vpc_name         = module.vpc.vpc_name
+  gke_subnet_name  = module.vpc.gke_subnet_name
+  machine_type     = "e2-standard-8"
+  node_count       = 3
+  enable_autoscaling = true
+  min_nodes        = 3
+  max_nodes        = 10
+}
+
+module "cloudsql" {
+  source       = "../../modules/cloudsql"
+  project_id   = var.project_id
+  project_name = var.project_name
+  environment  = "prod"
+  region       = var.region
+  vpc_id       = module.vpc.vpc_id
+  db_tier      = "db-custom-4-15360"
+}

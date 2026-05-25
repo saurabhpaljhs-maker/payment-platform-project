@@ -1,0 +1,39 @@
+# Network Policy — payment-gateway can only talk to transaction-service and DB
+# All other ingress/egress blocked
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-gateway-netpol
+  namespace: payments
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: transaction-service
+      ports:
+        - protocol: TCP
+          port: 8081
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 5432   # Cloud SQL proxy
+        - protocol: TCP
+          port: 443    # GCP APIs
+        - protocol: UDP
+          port: 53     # DNS

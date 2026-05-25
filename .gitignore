@@ -1,0 +1,27 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars.json
+.terraform.lock.hcl
+
+# Secrets — never commit
+*.key
+*.pem
+*secret*
+*password*
+.env
+
+# Build artifacts
+target/
+*.jar
+*.war
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Kubernetes — never commit kubeconfig
+kubeconfig
+*.kubeconfig

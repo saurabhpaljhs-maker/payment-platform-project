@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-gateway
+  namespace: payments
+  labels:
+    app: payment-gateway
+    version: "1.0"
+    team: payments
+  annotations:
+    kubernetes.io/change-cause: "IMAGE_TAG"   # Updated by pipeline
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: payment-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0           # Zero-downtime — critical for payments
+  template:
+    metadata:
+      labels:
+        app: payment-gateway
+        version: "1.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "8080"
+        prometheus.io/path:   "/actuator/prometheus"
+    spec:
+      serviceAccountName: payment-service-sa
+      terminationGracePeriodSeconds: 60   # Allow in-flight transactions to complete
+
+      containers:
+        - name: payment-gateway
+          image: IMAGE_PLACEHOLDER
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - configMapRef:
+                name: payment-gateway-config
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: payments-db-secret
+                  key: password
+            - name: PAYMENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: payment-gateway-secret
+                  key: api-key
+          resources:
+            requests:
+              cpu:    "250m"
+              memory: "512Mi"
+            limits:
+              cpu:    "1000m"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Graceful shutdown — wait for in-flight requests
+                command: ["/bin/sh", "-c", "sleep 10"]
+
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["payment-gateway"]
+              topologyKey: "kubernetes.io/hostname"
