@@ -208,12 +208,13 @@ Rollback: triggered automatically
         )
     }
 
-    always {
+        always {
 
         sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG} || true"
 
         cleanWs()
     }
+  }
 }
 
 def deployToGKE(String cluster, String namespace, String imageTag) {
