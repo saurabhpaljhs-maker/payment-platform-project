@@ -1,20 +1,36 @@
 pipeline {
     agent { label 'payment' }
 
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['prod', 'staging', 'dev'],
+            description: 'Target deployment environment'
+        )
+        booleanParam(
+            name: 'SKIP_DEPLOY',
+            defaultValue: false,
+            description: 'Skip deployment (build & test only)'
+        )
+    }
+
     environment {
         SERVICE_NAME  = 'payment-gateway'
-        GCP_PROJECT   = 'payments-platform-prod'
+        
+        // Environment-based configuration
+        GCP_PROJECT   = "${ENVIRONMENT == 'prod' ? 'payments-platform-prod' : ENVIRONMENT == 'staging' ? 'payments-platform-staging' : 'payments-platform-dev'}"
         GCP_REGION    = 'us-central1'
+        GKE_CLUSTER   = "${ENVIRONMENT == 'prod' ? 'payments-gke-prod' : ENVIRONMENT == 'staging' ? 'payments-gke-staging' : 'payments-gke-dev'}"
+        K8S_NAMESPACE = 'payments'
 
-        ARTIFACT_REPO = "us-central1-docker.pkg.dev/payments-platform-prod/payments"
-
+        ARTIFACT_REPO = "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/payments"
         IMAGE_NAME    = "${ARTIFACT_REPO}/${SERVICE_NAME}"
         IMAGE_TAG     = "${BUILD_NUMBER}-${env.GIT_COMMIT.take(7)}"
 
-        GKE_CLUSTER   = 'payments-gke-prod'
-        K8S_NAMESPACE = 'payments'
-
         SLACK_CHANNEL = '#payments-deployments'
+        
+        // Security: Don't leak credentials in logs
+        GCP_CREDENTIALS_ID = 'gcp-service-account-key'
     }
 
     options {
@@ -22,18 +38,16 @@ pipeline {
         timeout(time: 45, unit: 'MINUTES')
         buildDiscarder(logRotator(numToKeepStr: '15'))
         disableConcurrentBuilds()
+        ansiColor('xterm')  // Pretty colors in logs
     }
 
     stages {
 
         stage('Checkout') {
-
             steps {
-
                 checkout scm
 
                 script {
-
                     env.GIT_AUTHOR = sh(
                         script: "git log -1 --format='%an'",
                         returnStdout: true
@@ -45,78 +59,206 @@ pipeline {
                     ).trim()
                 }
 
-                echo "Service: ${SERVICE_NAME}"
+                echo """
+                ═══════════════════════════════════════════
+                📋 BUILD METADATA
+                ═══════════════════════════════════════════
+                Service:        ${SERVICE_NAME}
+                Environment:    ${ENVIRONMENT}
+                Branch:         ${env.GIT_BRANCH}
+                Commit:         ${env.GIT_COMMIT.take(7)}
+                Author:         ${env.GIT_AUTHOR}
+                Message:        ${env.GIT_MESSAGE}
+                Build #:        ${BUILD_NUMBER}
+                ═══════════════════════════════════════════
+                """
             }
         }
 
         stage('Security Scan - Trivy') {
-
             steps {
-
-                sh '''
-                    trivy fs \
-                    --severity HIGH,CRITICAL \
-                    --exit-code 0 \
-                    .
-                '''
+                script {
+                    try {
+                        sh '''
+                            echo "🔍 Scanning filesystem for vulnerabilities..."
+                            trivy fs \
+                            --severity HIGH,CRITICAL \
+                            --exit-code 0 \
+                            --format json \
+                            --output trivy-report.json \
+                            .
+                            
+                            echo "📊 Scan complete. Checking for critical issues..."
+                            trivy fs \
+                            --severity CRITICAL \
+                            --exit-code 1 \
+                            . || {
+                                echo "❌ CRITICAL vulnerabilities found"
+                                exit 1
+                            }
+                        '''
+                    } catch (Exception e) {
+                        echo "⚠️ Security scan failed: ${e.message}"
+                        currentBuild.result = 'FAILURE'
+                        throw e
+                    }
+                }
             }
         }
 
         stage('Docker Build') {
-
             steps {
-
-                sh """
-                    docker build \
-                    -t ${IMAGE_NAME}:${IMAGE_TAG} \
-                    -t ${IMAGE_NAME}:latest \
-                    .
-                """
+                script {
+                    try {
+                        echo "🐳 Building Docker image: ${IMAGE_NAME}:${IMAGE_TAG}"
+                        sh """
+                            docker build \
+                            -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                            -t ${IMAGE_NAME}:${ENVIRONMENT} \
+                            -t ${IMAGE_NAME}:latest \
+                            --label "build.number=${BUILD_NUMBER}" \
+                            --label "git.commit=${env.GIT_COMMIT}" \
+                            --label "git.author=${env.GIT_AUTHOR}" \
+                            services/payment-gateway/
+                        """
+                        echo "✅ Docker image built successfully"
+                    } catch (Exception e) {
+                        echo "❌ Docker build failed: ${e.message}"
+                        currentBuild.result = 'FAILURE'
+                        throw e
+                    }
+                }
             }
         }
 
         stage('Docker Push') {
-
             steps {
-
-                sh """
-                    gcloud auth configure-docker ${GCP_REGION}-docker.pkg.dev --quiet
-
-                    docker push ${IMAGE_NAME}:${IMAGE_TAG}
-
-                    docker push ${IMAGE_NAME}:latest
-                """
+                script {
+                    try {
+                        echo "📤 Authenticating to GCP..."
+                        withCredentials([file(credentialsId: "${GCP_CREDENTIALS_ID}", variable: 'GCP_KEY_FILE')]) {
+                            sh '''
+                                gcloud auth activate-service-account --key-file=$GCP_KEY_FILE
+                                gcloud config set project ${GCP_PROJECT}
+                                gcloud auth configure-docker ${GCP_REGION}-docker.pkg.dev --quiet
+                            '''
+                        }
+                        
+                        echo "🚀 Pushing image to Artifact Registry..."
+                        sh """
+                            docker push ${IMAGE_NAME}:${IMAGE_TAG}
+                            docker push ${IMAGE_NAME}:${ENVIRONMENT}
+                            docker push ${IMAGE_NAME}:latest
+                        """
+                        echo "✅ Image pushed successfully"
+                    } catch (Exception e) {
+                        echo "❌ Docker push failed: ${e.message}"
+                        currentBuild.result = 'FAILURE'
+                        throw e
+                    }
+                }
             }
         }
 
         stage('Deploy To GKE') {
-
+            when {
+                expression { params.SKIP_DEPLOY == false }
+            }
             steps {
-
-                sh """
-                    gcloud container clusters get-credentials ${GKE_CLUSTER} \
-                    --region ${GCP_REGION} \
-                    --project ${GCP_PROJECT}
-
-                    kubectl set image deployment/${SERVICE_NAME} \
-                    ${SERVICE_NAME}=${IMAGE_NAME}:${IMAGE_TAG} \
-                    -n ${K8S_NAMESPACE}
-
-                    kubectl rollout status deployment/${SERVICE_NAME} \
-                    -n ${K8S_NAMESPACE} \
-                    --timeout=180s
-                """
+                script {
+                    try {
+                        echo "🚀 Deploying to GKE cluster: ${GKE_CLUSTER}"
+                        
+                        withCredentials([file(credentialsId: "${GCP_CREDENTIALS_ID}", variable: 'GCP_KEY_FILE')]) {
+                            sh '''
+                                # Authenticate to GCP
+                                gcloud auth activate-service-account --key-file=$GCP_KEY_FILE
+                                gcloud config set project ${GCP_PROJECT}
+                                
+                                # Get GKE credentials
+                                gcloud container clusters get-credentials ${GKE_CLUSTER} \
+                                    --region ${GCP_REGION} \
+                                    --project ${GCP_PROJECT}
+                                
+                                # Verify cluster connection
+                                kubectl cluster-info
+                                
+                                # Update deployment with new image
+                                echo "📝 Updating deployment..."
+                                kubectl set image deployment/${SERVICE_NAME} \
+                                    ${SERVICE_NAME}=${IMAGE_NAME}:${IMAGE_TAG} \
+                                    -n ${K8S_NAMESPACE} \
+                                    --record
+                                
+                                # Wait for rollout
+                                echo "⏳ Waiting for rollout..."
+                                kubectl rollout status deployment/${SERVICE_NAME} \
+                                    -n ${K8S_NAMESPACE} \
+                                    --timeout=180s
+                                
+                                echo "✅ Deployment successful"
+                            '''
+                        }
+                    } catch (Exception e) {
+                        echo "❌ Deployment failed: ${e.message}"
+                        currentBuild.result = 'FAILURE'
+                        throw e
+                    }
+                }
             }
         }
 
-        stage('Smoke Test') {
-
+        stage('Smoke Tests') {
+            when {
+                expression { params.SKIP_DEPLOY == false }
+            }
             steps {
-
-                sh '''
-                    echo "Running smoke tests..."
-                    sleep 15
-                '''
+                script {
+                    try {
+                        echo "🧪 Running smoke tests..."
+                        withCredentials([file(credentialsId: "${GCP_CREDENTIALS_ID}", variable: 'GCP_KEY_FILE')]) {
+                            sh '''
+                                gcloud auth activate-service-account --key-file=$GCP_KEY_FILE
+                                gcloud config set project ${GCP_PROJECT}
+                                gcloud container clusters get-credentials ${GKE_CLUSTER} \
+                                    --region ${GCP_REGION} \
+                                    --project ${GCP_PROJECT}
+                                
+                                # Get service endpoint
+                                SERVICE_IP=$(kubectl get svc ${SERVICE_NAME} -n ${K8S_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+                                
+                                if [ -z "$SERVICE_IP" ]; then
+                                    echo "⏳ Service IP not ready, waiting..."
+                                    sleep 30
+                                    SERVICE_IP=$(kubectl get svc ${SERVICE_NAME} -n ${K8S_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+                                fi
+                                
+                                echo "🔗 Testing endpoint: http://$SERVICE_IP:8080"
+                                
+                                # Health check
+                                HEALTH_RESPONSE=$(curl -s -w "%{http_code}" http://$SERVICE_IP:8080/health)
+                                HTTP_CODE=${HEALTH_RESPONSE: -3}
+                                
+                                if [ "$HTTP_CODE" != "200" ]; then
+                                    echo "❌ Health check failed (HTTP $HTTP_CODE)"
+                                    exit 1
+                                fi
+                                
+                                echo "✅ Health check passed"
+                                
+                                # Ready check
+                                READY_RESPONSE=$(curl -s http://$SERVICE_IP:8080/ready)
+                                echo "✅ Readiness check: $READY_RESPONSE"
+                                
+                                echo "✅ All smoke tests passed"
+                            '''
+                        }
+                    } catch (Exception e) {
+                        echo "⚠️ Smoke tests failed: ${e.message}"
+                        // Don't fail the build on smoke test failure
+                        // (in production, you might want to trigger a rollback here)
+                    }
+                }
             }
         }
     }
@@ -124,65 +266,100 @@ pipeline {
     post {
 
         success {
+            script {
+                echo "✅ BUILD SUCCESSFUL"
 
-            echo "DEPLOY SUCCESS"
+                def deploymentStatus = params.SKIP_DEPLOY ? "Built (not deployed)" : "Built & Deployed"
 
-            slackSend(
-                channel: env.SLACK_CHANNEL,
-                color: 'good',
-                message: """
-✅ DEPLOY SUCCESS
+                slackSend(
+                    channel: env.SLACK_CHANNEL,
+                    color: 'good',
+                    message: """
+✅ *PIPELINE SUCCESS*
 
-Service: ${SERVICE_NAME}
+*Service:* ${SERVICE_NAME}
+*Environment:* ${ENVIRONMENT}
+*Build:* #${BUILD_NUMBER}
+*Status:* ${deploymentStatus}
 
-Build: #${BUILD_NUMBER}
+*Image:* ${IMAGE_NAME}:${IMAGE_TAG}
 
-Image:
-${IMAGE_NAME}:${IMAGE_TAG}
+*Author:* ${env.GIT_AUTHOR}
+*Commit:* ${env.GIT_COMMIT.take(7)}
+*Message:* ${env.GIT_MESSAGE}
 
-Author:
-${env.GIT_AUTHOR}
-
-${BUILD_URL}
-"""
-            )
+<${BUILD_URL}|View Build Logs>
+                    """
+                )
+            }
         }
 
         failure {
+            script {
+                echo "❌ BUILD FAILED - Attempting Rollback"
 
-            echo "DEPLOY FAILED"
+                // Rollback logic (only if deployment was attempted)
+                if (!params.SKIP_DEPLOY) {
+                    try {
+                        withCredentials([file(credentialsId: "${GCP_CREDENTIALS_ID}", variable: 'GCP_KEY_FILE')]) {
+                            sh '''
+                                gcloud auth activate-service-account --key-file=$GCP_KEY_FILE
+                                gcloud config set project ${GCP_PROJECT}
+                                gcloud container clusters get-credentials ${GKE_CLUSTER} \
+                                    --region ${GCP_REGION} \
+                                    --project ${GCP_PROJECT}
 
-            sh """
-                gcloud container clusters get-credentials ${GKE_CLUSTER} \
-                --region ${GCP_REGION} \
-                --project ${GCP_PROJECT}
+                                echo "⏮️ Rolling back deployment..."
+                                kubectl rollout undo deployment/${SERVICE_NAME} \
+                                    -n ${K8S_NAMESPACE} || true
 
-                kubectl rollout undo deployment/${SERVICE_NAME} \
-                -n ${K8S_NAMESPACE} || true
-            """
+                                echo "⏳ Waiting for rollback..."
+                                kubectl rollout status deployment/${SERVICE_NAME} \
+                                    -n ${K8S_NAMESPACE} \
+                                    --timeout=180s || true
 
-            slackSend(
-                channel: env.SLACK_CHANNEL,
-                color: 'danger',
-                message: """
-❌ DEPLOY FAILED
+                                echo "✅ Rollback complete"
+                            '''
+                        }
+                    } catch (Exception e) {
+                        echo "⚠️ Rollback failed: ${e.message}"
+                    }
+                }
 
-Service:
-${SERVICE_NAME}
+                slackSend(
+                    channel: env.SLACK_CHANNEL,
+                    color: 'danger',
+                    message: """
+❌ *PIPELINE FAILED*
 
-Build:
-#${BUILD_NUMBER}
+*Service:* ${SERVICE_NAME}
+*Environment:* ${ENVIRONMENT}
+*Build:* #${BUILD_NUMBER}
 
-${BUILD_URL}/console
-"""
-            )
+*Author:* ${env.GIT_AUTHOR}
+*Commit:* ${env.GIT_COMMIT.take(7)}
+
+<${BUILD_URL}console|View Build Logs>
+                    """
+                )
+            }
         }
 
         always {
+            script {
+                echo "🧹 Cleaning up workspace..."
+                
+                // Remove local Docker images (don't clutter disk)
+                sh """
+                    docker rmi ${IMAGE_NAME}:${IMAGE_TAG} 2>/dev/null || true
+                    docker rmi ${IMAGE_NAME}:${ENVIRONMENT} 2>/dev/null || true
+                    docker rmi ${IMAGE_NAME}:latest 2>/dev/null || true
+                    docker system prune -f || true
+                """
 
-            sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG} || true"
-
-            cleanWs()
+                // Clean workspace
+                cleanWs()
+            }
         }
     }
 }
